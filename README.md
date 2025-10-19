@@ -1,101 +1,104 @@
-# WeDDOS Guard v3.3
+WeDDOS Guard v3.3
+WeDDOS Guard is a Python-based script designed to protect Minecraft servers (optimized for 100+ players) from Distributed Denial of Service (DDoS) attacks. It uses Linux iptables and ipset to monitor and block malicious IPs, brute-force attempts, and suspicious traffic patterns while keeping server performance efficient. The script is lightweight, with features like batch processing, local caching, and automatic attack escalation.
+Purpose
+Minecraft servers, especially those with many players, are common targets for DDoS attacks, which flood the server with traffic to disrupt gameplay. WeDDOS Guard mitigates these by:
 
-A lightweight, Python-based DDoS protection script optimized for Minecraft servers handling 100+ concurrent players. It uses iptables, ipset, and connection monitoring to detect and block suspicious IPs, brute-force attempts, and common attack patterns. The script focuses on low overhead, batch processing, and automatic escalation during high traffic.
+Blocking IPs with excessive connections.
+Stopping SSH brute-force attacks.
+Filtering out known malicious IPs (e.g., datacenters).
+Applying rate limits and protections to key ports.
+Escalating defenses during high traffic.
 
-**Key Improvements in v3.3:**
-- Automatic external interface detection.
-- Reduced subprocess overhead for better performance.
-- Local blocked IP cache to avoid redundant operations.
-- Batching of IP blocks to prevent churn.
-- Learn mode for initial observation without blocking.
-- Discord webhook notifications for alerts.
+Note: This script is tuned for Minecraft but can be adapted for other services. Always test in a staging environment before production use, as misconfiguration may block legitimate users.
+Features
 
-**NOTE:** This script is intended for Linux systems with iptables and ipset. Always test on a staging environment before production. Run as root.
+Dynamic Blocking: Monitors SYN (new) connections using ss and blocks IPs exceeding connection limits after repeated offenses.
+Static Blocklists: Loads lists of known bad IPs (e.g., datacenters) from online sources for proactive blocking.
+SSH Brute-Force Protection: Scans /var/log/auth.log for failed SSH login attempts and blocks IPs after too many failures.
+Port-Specific Rules: Applies connection limits, rate limits, and hashlimits to protect ports like 22 (SSH), 80/443 (web), and 25565 (Minecraft).
+Global Escalation: During detected attacks (high new connections), it throttles new connections and relaxes when safe.
+Port Scan Detection: Blocks IPs attempting to scan multiple ports.
+Raw Filters: Drops invalid packets, bad TCP flags, and reserved IP ranges early in the network stack.
+Kernel Hardening: Enables SYN cookies and strict connection tracking.
+Discord Notifications: Sends alerts for blocked IPs and attack events (optional).
+Learn Mode: Observes traffic without blocking for the first 24 hours to help tune thresholds.
+Efficiency: Uses batch IP blocking, local cache, and optimized checks to reduce CPU usage.
 
-## Features
+Requirements
 
-- **Dynamic IP Blocking:** Monitors SYN connections via `ss` and blocks IPs exceeding connection thresholds after repeated offenses.
-- **Static Blocklists:** Fetches and blocks IPs from datacenter ranges and generic bad IP lists.
-- **Brute-Force Detection:** Scans `/var/log/auth.log` for SSH failed logins and blocks repeat offenders.
-- **Per-Port Protections:** Applies connection limits, hashlimits, and rate limits to whitelisted ports (e.g., 22, 53, 80, 443, 25565 for Minecraft).
-- **Global Escalation:** Temporarily throttles new connections during detected attacks and relaxes when traffic normalizes.
-- **Raw and Global Filters:** Drops invalid packets, fragments, bogus TCP flags, and more using raw and filter tables.
-- **Port Scan Detection:** Blocks IPs attempting port scans.
-- **Kernel Hardening:** Applies sysctl tweaks for SYN cookies and strict conntrack.
-- **Notifications:** Optional Discord webhook for block events and attack summaries.
-- **Learn Mode:** Observes traffic for the first 24 hours without blocking (configurable).
+Operating System: Linux with iptables, ipset, and ss (from iproute2).
+Python: Version 3.6 or higher.
+Python Library: requests for fetching blocklists and sending Discord alerts (pip install requests).
+Privileges: Must run as root to modify firewall rules and access logs.
+Log Access: /var/log/auth.log for brute-force detection (adjust if your system uses a different log).
+Network: Internet for initial blocklist fetch; optional for Discord.
 
-## Requirements
+Installation
+Follow these steps to set up WeDDOS Guard:
 
-- Python 3.6+ (tested on 3.x).
-- Linux with:
-  - iptables (including conntrack, limit, hashlimit, recent, set, ttl modules).
-  - ipset.
-  - ss (from iproute2).
-- Root privileges.
-- Optional: requests library (for Discord and blocklist fetching; install via `pip install requests`).
-- Access to `/var/log/auth.log` for brute-force monitoring.
+Download the Script:Save the provided script as weddos_guard.py in a directory of your choice (e.g., /opt/weddos/).
 
-No internet access is required after initial blocklist fetch, but it's needed for updates.
+Install Dependencies:On Debian/Ubuntu:
+sudo apt update
+sudo apt install iptables ipset iproute2 python3 python3-requests
 
-## Installation
+For CentOS/RHEL:
+sudo yum install iptables ipset iproute python3 python3-requests
 
-1. **Download the Script:**
-   Save the script as `weddos_guard.py` (or similar).
+Verify iptables, ipset, and ss are installed:
+iptables -V
+ipset -V
+ss --version
 
-2. **Install Dependencies:**
-   ```
-   sudo apt update
-   sudo apt install iptables ipset iproute2 python3-requests
-   ```
-   (Adjust for your distro, e.g., yum on CentOS.)
 
-3. **Configure the Script:**
-   Edit the script's CONFIG section:
-   - `CHECK_INTERVAL`: Loop delay (default: 4 seconds).
-   - `BLOCK_TIME`: Block duration (default: 600 seconds).
-   - `CONN_THRESHOLD`: Per-IP connection limit before flagging (default: 200).
-   - `REPEAT_HITCOUNT`: Loops an IP must exceed threshold before blocking (default: 3).
-   - `BATCH_ADD_LIMIT`: Max blocks per loop (default: 10).
-   - `WHITELIST_PORTS`: Ports to protect (default: {22, 53, 80, 443, 25565}).
-   - `MAX_CONN_PER_IP`: Per-IP connlimit (default: 30).
-   - `HASHLIMIT_RATE`, `HASHLIMIT_BURST`: New connection rate limits.
-   - `ICMP_RATE`, `ICMP_BURST`: ICMP limits.
-   - `SYN_RATE`, `SYN_BURST`: SYN packet limits.
-   - `UDP_RATE`, `UDP_BURST`: UDP limits.
-   - `GLOBAL_NEW_CONN_WARNING`: Trigger escalation if new connections exceed this (default: 1500).
-   - `PORT_SCAN_THRESHOLD`: Hits for port scan block (default: 5).
-   - `DISCORD_WEBHOOK`: Your Discord webhook URL (leave empty to disable).
-   - `LEARN_MODE`: Set to True for observation-only mode (default: False).
-   - `LEARN_DURATION`: Learn mode duration (default: 24 hours).
-   - Blocklist URLs: Customize `DATACENTER_IP_LIST_URL` and `GENERIC_BAD_IP_LIST_URL`.
+Configure the Script:Open weddos_guard.py in a text editor and adjust the CONFIG section:
 
-4. **Make Executable:**
-   ```
-   chmod +x weddos_guard.py
-   ```
+CHECK_INTERVAL (default: 4 seconds): How often the script checks traffic. Increase for lower CPU usage.
+BLOCK_TIME (default: 600 seconds): How long blocked IPs stay blocked.
+CONN_THRESHOLD (default: 200): Max simultaneous connections per IP before flagging as suspicious.
+REPEAT_HITCOUNT (default: 3): Number of checks an IP must exceed CONN_THRESHOLD before blocking.
+BATCH_ADD_LIMIT (default: 10): Max IPs blocked per cycle to avoid overwhelming the system.
+WHITELIST_PORTS (default: {22, 53, 80, 443, 25565}): Ports to protect. Add/remove based on your server’s needs (e.g., custom Minecraft port).
+MAX_CONN_PER_IP (default: 30): Limits connections per IP per port.
+HASHLIMIT_RATE (default: 20/min), HASHLIMIT_BURST (default: 10): Rate limits for new connections per port.
+ICMP_RATE (default: 10/s), ICMP_BURST (default: 20): Limits for ICMP (ping) traffic.
+SYN_RATE (default: 200/s), SYN_BURST (default: 500): Limits for TCP SYN packets.
+UDP_RATE (default: 2000/s), UDP_BURST (default: 1000): Limits for UDP packets (common in Minecraft).
+GLOBAL_NEW_CONN_WARNING (default: 1500): Triggers escalation if new connections exceed this.
+PORT_SCAN_THRESHOLD (default: 5): Blocks IPs after this many port scan attempts.
+DISCORD_WEBHOOK (default: ""): Set to your Discord webhook URL for alerts (leave empty to disable).
+LEARN_MODE (default: False): Set to True to observe traffic without blocking for LEARN_DURATION (default: 24 hours).
+DATACENTER_IP_LIST_URL, GENERIC_BAD_IP_LIST_URL: URLs for blocklists. Defaults fetch datacenter and known bad IPs.
 
-## Usage
 
+Make Executable:
+chmod +x /path/to/weddos_guard.py
+
+
+
+Usage
 Run the script as root:
-```
-sudo ./weddos_guard.py
-```
+sudo /path/to/weddos_guard.py
 
-- It will auto-detect the external interface (e.g., eth0).
-- Fetches blocklists on startup.
-- Applies iptables rules and ipsets.
-- Runs in an infinite loop, monitoring every `CHECK_INTERVAL` seconds.
-- Logs to stdout (redirect to a file if needed, e.g., `sudo ./weddos_guard.py > /var/log/weddos.log`).
 
-To stop: Use Ctrl+C or kill the process. Rules remain intact for safety—manually clean up if needed (e.g., `iptables -F WEDDOS-PORT; ipset destroy weddos_block`).
+What It Does:
+Detects the external network interface (e.g., eth0).
+Loads blocklists and sets up iptables/ipset.
+Applies kernel hardening (e.g., SYN cookies).
+Monitors traffic every CHECK_INTERVAL seconds.
+Logs actions to the terminal (e.g., blocked IPs, attack start/end).
 
-### Running as a Service
 
-Create a systemd unit file `/etc/systemd/system/weddos-guard.service`:
-```
-[Unit]
-Description=WeDDOS Guard
+Stop the Script: Press Ctrl+C. Firewall rules remain active for safety.
+Log to File: Redirect output:sudo /path/to/weddos_guard.py > /var/log/weddos.log 2>&1
+
+
+
+Running as a System Service
+To run automatically on boot:
+
+Create a systemd service file at /etc/systemd/system/weddos-guard.service:[Unit]
+Description=WeDDOS Guard DDoS Protection
 After=network.target
 
 [Service]
@@ -105,65 +108,73 @@ User=root
 
 [Install]
 WantedBy=multi-user.target
-```
 
-Then:
-```
-sudo systemctl daemon-reload
+
+Enable and start:sudo systemctl daemon-reload
 sudo systemctl start weddos-guard
 sudo systemctl enable weddos-guard
-```
 
-## How It Works
 
-1. **Initialization:**
-   - Applies sysctl hardening.
-   - Creates ipsets for dynamic, datacenter, and bad IP blocks.
-   - Fetches and loads static blocklists.
-   - Sets up iptables chains (WEDDOS-PORT, WEDDOS-RAW).
-   - Applies raw filters (e.g., drop invalid sources, states).
-   - Applies global filters (e.g., drop fragments, bogus flags, ICMP limits).
+Check status:sudo systemctl status weddos-guard
 
-2. **Monitoring Loop:**
-   - Checks auth.log for SSH brute-force.
-   - Dynamically detects listening ports and applies protections (connlimit, hashlimit, rate limits).
-   - Uses `ss` to count SYN connections; flags high-connection IPs.
-   - Blocks after repeated thresholds (with batching).
-   - Escalates globally if total new connections spike (throttles to 50/s).
-   - Relaxes when traffic normalizes and sends attack summary.
 
-3. **Blocking Logic:**
-   - Uses ipset with timeouts for efficient blocking.
-   - Local cache to avoid duplicates.
-   - Learn mode skips blocks for initial period.
 
-## Troubleshooting
+How It Works
 
-- **No Blocks Happening:** Check if in learn mode or thresholds are too high.
-- **High CPU:** Increase `CHECK_INTERVAL` or reduce `BATCH_ADD_LIMIT`.
-- **Interface Detection Fails:** Hardcode `EXTERNAL_IFACE` in the script.
-- **Discord Fails:** Ensure webhook URL is correct and network access.
-- **Errors on Startup:** Verify iptables/ipset modules are loaded (`modprobe ip_set xt_set`).
-- **Clean Up Rules:** To remove all:
-  ```
-  iptables -D INPUT -j WEDDOS-PORT
-  iptables -F WEDDOS-PORT
-  iptables -X WEDDOS-PORT
-  iptables -t raw -D PREROUTING -j WEDDOS-RAW
-  iptables -t raw -F WEDDOS-RAW
-  iptables -t raw -X WEDDOS-RAW
-  ipset destroy weddos_block
-  ipset destroy datacenter_block
-  ipset destroy bad_list_block
-  ```
+Initialization:
 
-## Warnings
+Applies kernel tweaks (e.g., enables SYN cookies).
+Creates three ipset sets: weddos_block (dynamic blocks), datacenter_block (datacenter IPs), bad_list_block (known bad IPs).
+Fetches and loads blocklists from configured URLs.
+Sets up iptables chains (WEDDOS-PORT, WEDDOS-RAW) for filtering.
+Adds raw filters to drop invalid packets (e.g., bad TCP flags, reserved IPs).
+Adds global filters for fragments, ICMP, and port scans.
 
-- **Production Use:** Test thoroughly—misconfiguration can block legitimate traffic.
-- **Minecraft-Specific:** Tuned for high-player servers; adjust thresholds for other uses.
-- **No Persistence:** Blocklists refresh on restart; rules don't survive reboots unless scripted.
-- **Legal/Compliance:** Ensure blocklists comply with your jurisdiction.
 
-## License
+Monitoring Loop:
 
-This script is provided as-is, without warranty. Feel free to modify and use under MIT License. Contributions welcome!
+Checks /var/log/auth.log for SSH brute-force attempts (blocks after BRUTE_FORCE_FAILS).
+Scans listening ports with ss and applies protections (connection limits, rate limits) to non-whitelisted ports.
+Counts SYN connections to detect high-connection IPs.
+Blocks IPs after REPEAT_HITCOUNT violations of CONN_THRESHOLD (batched to BATCH_ADD_LIMIT).
+Escalates during high traffic (GLOBAL_NEW_CONN_WARNING), limiting new connections to 50/s.
+Relaxes when traffic drops, sending a summary of blocked IPs via Discord.
+
+
+Blocking Mechanism:
+
+Uses ipset for efficient, temporary blocks (timeout: BLOCK_TIME).
+Maintains a local cache to avoid duplicate blocks.
+Skips blocking in learn mode for initial tuning.
+
+
+
+Troubleshooting
+
+No IPs Blocked: Check if LEARN_MODE is True or if CONN_THRESHOLD/REPEAT_HITCOUNT is too high.
+High CPU Usage: Increase CHECK_INTERVAL or lower BATCH_ADD_LIMIT.
+Wrong Interface: Set EXTERNAL_IFACE manually in the script.
+Discord Not Working: Verify webhook URL and internet access.
+Firewall Errors: Ensure iptables/ipset modules are loaded:sudo modprobe ip_set xt_set
+
+
+Remove Rules: To clear all WeDDOS rules and sets:sudo iptables -D INPUT -j WEDDOS-PORT
+sudo iptables -F WEDDOS-PORT
+sudo iptables -X WEDDOS-PORT
+sudo iptables -t raw -D PREROUTING -j WEDDOS-RAW
+sudo iptables -t raw -F WEDDOS-RAW
+sudo iptables -t raw -X WEDDOS-RAW
+sudo ipset destroy weddos_block
+sudo ipset destroy datacenter_block
+sudo ipset destroy bad_list_block
+
+
+
+Important Notes
+
+Test Thoroughly: Misconfigured thresholds can block legitimate players. Use learn mode to observe traffic first.
+Minecraft Tuning: Optimized for port 25565 and high-player servers. Adjust for other ports/services.
+No Persistence: Blocklists and rules reset on reboot unless scripted.
+Legal: Ensure blocklists comply with local laws.
+Logs: Check /var/log/weddos.log (if redirected) or terminal for blocked IPs and errors.
+License: MIT License—free to use and modify.
