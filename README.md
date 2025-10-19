@@ -1,331 +1,169 @@
-# 🛡️ WeDDOS Guard v1.7 — Adaptive Defense Against Real-World DDoS Threats
+# WeDDOS Guard v3.3
 
-**Author:** WeThink
-**Version:** v1.7  
-**Tagline:** **WeDDOS Guard — Adaptive Defense Against Real-World DDoS Threats.**  
-**Language:** Python 3  
-**License:** MIT
+A lightweight, Python-based DDoS protection script optimized for Minecraft servers handling 100+ concurrent players. It uses iptables, ipset, and connection monitoring to detect and block suspicious IPs, brute-force attempts, and common attack patterns. The script focuses on low overhead, batch processing, and automatic escalation during high traffic.
 
-> Lightweight, adaptive Layer-4 flood protection for VPS and dedicated servers — automated mitigation, ipset blacklisting, and Discord alerts.
+**Key Improvements in v3.3:**
+- Automatic external interface detection.
+- Reduced subprocess overhead for better performance.
+- Local blocked IP cache to avoid redundant operations.
+- Batching of IP blocks to prevent churn.
+- Learn mode for initial observation without blocking.
+- Discord webhook notifications for alerts.
 
----
+**NOTE:** This script is intended for Linux systems with iptables and ipset. Always test on a staging environment before production. Run as root.
 
-# Table of Contents
-1. [Overview](#overview)  
-2. [Features](#features)  
-3. [Prerequisites](#prerequisites)  
-4. [Installation](#installation)  
-5. [Configuration](#configuration)  
-6. [Run & Host (manual)](#run--host-manual)  
-7. [Run & Host (systemd service)](#run--host-systemd-service)  
-8. [Optional: Docker (advanced)](#optional-docker-advanced)  
-9. [How it works (high level)](#how-it-works-high-level)  
-10. [Tuning & Hardening Tips](#tuning--hardening-tips)  
-11. [Troubleshooting & FAQs](#troubleshooting--faqs)  
-12. [Notes & Warnings](#notes--warnings)  
-13. [License & Credits](#license--credits)
+## Features
 
----
+- **Dynamic IP Blocking:** Monitors SYN connections via `ss` and blocks IPs exceeding connection thresholds after repeated offenses.
+- **Static Blocklists:** Fetches and blocks IPs from datacenter ranges and generic bad IP lists.
+- **Brute-Force Detection:** Scans `/var/log/auth.log` for SSH failed logins and blocks repeat offenders.
+- **Per-Port Protections:** Applies connection limits, hashlimits, and rate limits to whitelisted ports (e.g., 22, 53, 80, 443, 25565 for Minecraft).
+- **Global Escalation:** Temporarily throttles new connections during detected attacks and relaxes when traffic normalizes.
+- **Raw and Global Filters:** Drops invalid packets, fragments, bogus TCP flags, and more using raw and filter tables.
+- **Port Scan Detection:** Blocks IPs attempting port scans.
+- **Kernel Hardening:** Applies sysctl tweaks for SYN cookies and strict conntrack.
+- **Notifications:** Optional Discord webhook for block events and attack summaries.
+- **Learn Mode:** Observes traffic for the first 24 hours without blocking (configurable).
 
-# Overview
-**WeDDOS Guard v1.7** is a production-focused Python script that hardens kernel TCP/IP parameters, creates iptables/ipset mitigations, watches live connections (via `ss`/`netstat`) and dynamically blocks abusive IPs. It targets TCP/UDP/ICMP floods, SYN/ACK/RST/FIN abuses, port scanning, spoofing and performs escalation/relaxation automatically.
+## Requirements
 
----
+- Python 3.6+ (tested on 3.x).
+- Linux with:
+  - iptables (including conntrack, limit, hashlimit, recent, set, ttl modules).
+  - ipset.
+  - ss (from iproute2).
+- Root privileges.
+- Optional: requests library (for Discord and blocklist fetching; install via `pip install requests`).
+- Access to `/var/log/auth.log` for brute-force monitoring.
 
-# Features
-- Kernel hardening (`sysctl`) for anti-spoofing & strict TCP state  
-- iptables rules for malformed packets, TCP-flag abuse, FIN/RST limits  
-- Per-port protections (connlimit, hashlimit, syn limits)  
-- ipset timed blacklisting for repeat offenders  
-- Adaptive global throttling when new-connection flood detected  
-- Port-scan detection and automated blocking  
-- Discord webhook notifications on blocks/escalation/relaxation  
-- Lightweight — uses `ss` or `netstat` only; no heavy dependencies
+No internet access is required after initial blocklist fetch, but it's needed for updates.
 
----
+## Installation
 
-# Prerequisites
-- Root access on a Linux VPS or dedicated server. (You **must** run as root.)  
-- Python 3.6+ installed.  
-- `iptables`, `ipset`, `ss` / `iproute2` (or `net-tools` for `netstat`).  
-- `pip` and the `requests` package if you want Discord alerts (`pip3 install requests`).
+1. **Download the Script:**
+   Save the script as `weddos_guard.py` (or similar).
 
-Install required packages (Debian/Ubuntu example):
+2. **Install Dependencies:**
+   ```
+   sudo apt update
+   sudo apt install iptables ipset iproute2 python3-requests
+   ```
+   (Adjust for your distro, e.g., yum on CentOS.)
 
-```bash
-sudo apt update
-sudo apt install -y python3 python3-pip iptables ipset iproute2
-pip3 install requests
+3. **Configure the Script:**
+   Edit the script's CONFIG section:
+   - `CHECK_INTERVAL`: Loop delay (default: 4 seconds).
+   - `BLOCK_TIME`: Block duration (default: 600 seconds).
+   - `CONN_THRESHOLD`: Per-IP connection limit before flagging (default: 200).
+   - `REPEAT_HITCOUNT`: Loops an IP must exceed threshold before blocking (default: 3).
+   - `BATCH_ADD_LIMIT`: Max blocks per loop (default: 10).
+   - `WHITELIST_PORTS`: Ports to protect (default: {22, 53, 80, 443, 25565}).
+   - `MAX_CONN_PER_IP`: Per-IP connlimit (default: 30).
+   - `HASHLIMIT_RATE`, `HASHLIMIT_BURST`: New connection rate limits.
+   - `ICMP_RATE`, `ICMP_BURST`: ICMP limits.
+   - `SYN_RATE`, `SYN_BURST`: SYN packet limits.
+   - `UDP_RATE`, `UDP_BURST`: UDP limits.
+   - `GLOBAL_NEW_CONN_WARNING`: Trigger escalation if new connections exceed this (default: 1500).
+   - `PORT_SCAN_THRESHOLD`: Hits for port scan block (default: 5).
+   - `DISCORD_WEBHOOK`: Your Discord webhook URL (leave empty to disable).
+   - `LEARN_MODE`: Set to True for observation-only mode (default: False).
+   - `LEARN_DURATION`: Learn mode duration (default: 24 hours).
+   - Blocklist URLs: Customize `DATACENTER_IP_LIST_URL` and `GENERIC_BAD_IP_LIST_URL`.
+
+4. **Make Executable:**
+   ```
+   chmod +x weddos_guard.py
+   ```
+
+## Usage
+
+Run the script as root:
+```
+sudo ./weddos_guard.py
 ```
 
-CentOS/RHEL example:
+- It will auto-detect the external interface (e.g., eth0).
+- Fetches blocklists on startup.
+- Applies iptables rules and ipsets.
+- Runs in an infinite loop, monitoring every `CHECK_INTERVAL` seconds.
+- Logs to stdout (redirect to a file if needed, e.g., `sudo ./weddos_guard.py > /var/log/weddos.log`).
 
-```bash
-sudo yum install -y python3 python3-pip iptables ipset iproute
-pip3 install requests
+To stop: Use Ctrl+C or kill the process. Rules remain intact for safety—manually clean up if needed (e.g., `iptables -F WEDDOS-PORT; ipset destroy weddos_block`).
+
+### Running as a Service
+
+Create a systemd unit file `/etc/systemd/system/weddos-guard.service`:
 ```
-
----
-
-# Installation
-
-1. Place the script on the server (example filename `weddos_guard.py`):
-
-```bash
-sudo mkdir -p /opt/weddos
-sudo chown $USER:$USER /opt/weddos
-# on your workstation:
-scp weddos_guard.py root@your-server:/opt/weddos/
-```
-
-2. Make it executable:
-
-```bash
-sudo chmod +x /opt/weddos/weddos_guard.py
-```
-
-3. Install Python dependency:
-
-```bash
-sudo pip3 install requests
-```
-
----
-
-# Configuration
-
-Open the script `/opt/weddos/weddos_guard.py` and edit the top configuration block:
-
-```python
-DISCORD_WEBHOOK = ""               # <-- Add your Discord webhook URL if you want alerts
-CHECK_INTERVAL = 5                 # seconds between monitoring loops
-CONN_THRESHOLD = 500               # simultaneous connections threshold per IP
-REPEAT_HITCOUNT = 2                # hits before ipset blocking
-BLOCK_TIME = 600                   # ipset block timeout (seconds)
-IPSET_NAME = "weddos_block"
-CHAIN_NAME = "WEDDOS-PORT"
-WHITELIST_PORTS = {22, 53, 80, 443} # add essential service ports (SSH, DNS, HTTP, HTTPS)
-MAX_CONN_PER_IP = 60               # per-port simultaneous conn limit per IP
-HASHLIMIT_RATE = "20/min"          # per-IP new connection rate
-...
-```
-
-Important:
-- Make sure `WHITELIST_PORTS` includes **SSH (22)** unless you have another SSH access method, or you'll risk locking yourself out.
-- If you run services on unusual ports, add those ports to `WHITELIST_PORTS`.
-- `DISCORD_WEBHOOK` is optional but useful for live alerts.
-
-> Tip: Back up the script after editing: `cp weddos_guard.py weddos_guard.py.bak`
-
----
-
-# Run & Host (manual)
-To run the script interactively:
-
-```bash
-sudo python3 /opt/weddos/weddos_guard.py
-```
-
-or:
-
-```bash
-sudo /opt/weddos/weddos_guard.py
-```
-
-The script will:
-1. Apply `sysctl` hardening.
-2. Create and link ipsets and the custom iptables chain.
-3. Apply global rules and per-port protections.
-4. Enter a continuous loop monitoring connections and applying mitigation.
-
-To stop: press `Ctrl+C` (SIGINT). Rules remain in iptables/ipset for inspection. To flush everything (careful):
-
-```bash
-# Flush iptables chain (example)
-sudo iptables -D INPUT -j WEDDOS-PORT 2>/dev/null || true
-sudo iptables -F WEDDOS-PORT 2>/dev/null || true
-sudo iptables -X WEDDOS-PORT 2>/dev/null || true
-
-# Clear ipsets
-sudo ipset flush weddos_block
-sudo ipset destroy weddos_block
-```
-
----
-
-# Run & Host (systemd service)
-
-To run WeDDOS Guard automatically and reliably across reboots, create a systemd service.
-
-1. Create the service file `/etc/systemd/system/weddos.service`:
-
-```ini
 [Unit]
-Description=WeDDOS Guard v1.7 - Adaptive DDoS Mitigation
+Description=WeDDOS Guard
 After=network.target
-Wants=network-online.target
 
 [Service]
-Type=simple
+ExecStart=/path/to/weddos_guard.py
+Restart=always
 User=root
-ExecStart=/usr/bin/python3 /opt/weddos/weddos_guard.py
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-2. Reload systemd and enable:
-
-```bash
+Then:
+```
 sudo systemctl daemon-reload
-sudo systemctl enable --now weddos.service
+sudo systemctl start weddos-guard
+sudo systemctl enable weddos-guard
 ```
 
-3. Check status & logs:
+## How It Works
 
-```bash
-sudo systemctl status weddos.service
-sudo journalctl -u weddos.service -f
-```
+1. **Initialization:**
+   - Applies sysctl hardening.
+   - Creates ipsets for dynamic, datacenter, and bad IP blocks.
+   - Fetches and loads static blocklists.
+   - Sets up iptables chains (WEDDOS-PORT, WEDDOS-RAW).
+   - Applies raw filters (e.g., drop invalid sources, states).
+   - Applies global filters (e.g., drop fragments, bogus flags, ICMP limits).
 
-If you edit the script, `systemctl restart weddos.service`.
+2. **Monitoring Loop:**
+   - Checks auth.log for SSH brute-force.
+   - Dynamically detects listening ports and applies protections (connlimit, hashlimit, rate limits).
+   - Uses `ss` to count SYN connections; flags high-connection IPs.
+   - Blocks after repeated thresholds (with batching).
+   - Escalates globally if total new connections spike (throttles to 50/s).
+   - Relaxes when traffic normalizes and sends attack summary.
 
----
+3. **Blocking Logic:**
+   - Uses ipset with timeouts for efficient blocking.
+   - Local cache to avoid duplicates.
+   - Learn mode skips blocks for initial period.
 
-# Optional: Docker (advanced)
+## Troubleshooting
 
-> NOTE: Docker is **not recommended** for direct packet mangling (`iptables`, `ipset`) because containers add networking complexity. Use systemd method on host. If you still want to isolate the process, run it on the host network namespace (privileged) — advanced and beyond basic guide.
+- **No Blocks Happening:** Check if in learn mode or thresholds are too high.
+- **High CPU:** Increase `CHECK_INTERVAL` or reduce `BATCH_ADD_LIMIT`.
+- **Interface Detection Fails:** Hardcode `EXTERNAL_IFACE` in the script.
+- **Discord Fails:** Ensure webhook URL is correct and network access.
+- **Errors on Startup:** Verify iptables/ipset modules are loaded (`modprobe ip_set xt_set`).
+- **Clean Up Rules:** To remove all:
+  ```
+  iptables -D INPUT -j WEDDOS-PORT
+  iptables -F WEDDOS-PORT
+  iptables -X WEDDOS-PORT
+  iptables -t raw -D PREROUTING -j WEDDOS-RAW
+  iptables -t raw -F WEDDOS-RAW
+  iptables -t raw -X WEDDOS-RAW
+  ipset destroy weddos_block
+  ipset destroy datacenter_block
+  ipset destroy bad_list_block
+  ```
 
-Example Dockerfile (not full solution):
+## Warnings
 
-```dockerfile
-FROM python:3.10-slim
-RUN pip install requests
-COPY weddos_guard.py /app/weddos_guard.py
-ENTRYPOINT ["python3","/app/weddos_guard.py"]
-```
+- **Production Use:** Test thoroughly—misconfiguration can block legitimate traffic.
+- **Minecraft-Specific:** Tuned for high-player servers; adjust thresholds for other uses.
+- **No Persistence:** Blocklists refresh on restart; rules don't survive reboots unless scripted.
+- **Legal/Compliance:** Ensure blocklists comply with your jurisdiction.
 
-Run with privileged networking (risky):
+## License
 
-```bash
-sudo docker build -t weddos .
-sudo docker run --rm --privileged --net=host -v /lib/modules:/lib/modules weddos
-```
-
-Again: prefer running on host as systemd service.
-
----
-
-# How it works (high level)
-
-1. **Kernel tweaks**: Enables SYN cookies, strict conntrack, rp_filter (anti-spoof).  
-2. **iptables chain** (`WEDDOS-PORT`): All non-established packets pass through it — global filters catch invalid, malformed or suspicious TCP flags, fragments, smurf/broadcasts and ICMP rate-limit.  
-3. **Per-port rules**: Connlimit, hashlimit and SYN limits applied per listening port (except whitelisted ports).  
-4. **Detection**: `ss`/`netstat` parsing finds IPs with excessive simultaneous connections. Repeated offenders are added to an `ipset` block (timed).  
-5. **Escalation**: If system-wide new connections exceed threshold, an aggressive global throttle is inserted; it auto-relaxes when the flood subsides.  
-6. **Notifications**: Discord webhook posts on blocks, escalations and relaxations.
-
----
-
-# Tuning & Hardening Tips
-
-- **Whitelist SSH (22)** or use jump/bastion host. If you lock out SSH, console access (VPS provider) may be required.  
-- **Lower CONN_THRESHOLD and MAX_CONN_PER_IP** for small VPS. Example for 2–4 vCPU: `CONN_THRESHOLD = 200`, `MAX_CONN_PER_IP = 20`.  
-- **Adjust CHECK_INTERVAL**: shorter interval makes mitigation faster but increases CPU. 3–10 seconds reasonable.  
-- **Increase nf_conntrack_max** if your server handles many connections (in `/etc/sysctl.conf` or in the script tweaks).  
-- **Monitoring**: integrate with Prometheus, Grafana or external log shipper if desired. The script currently logs to stdout; `systemd` captures it in journal.  
-- **Persistent ipset on reboot**: Use `ipset save` / `ipset restore` or restore rules on boot via systemd unit with pre-start script (advanced).
-
----
-
-# Troubleshooting & FAQs
-
-Q — *I started it and got locked out of SSH.*  
-A — Immediately use VPS provider console/serial access. Before running, ensure `WHITELIST_PORTS` includes SSH port, or restrict the script to test on non-production environment.
-
-Q — *How do I see what IPs are blocked?*  
-A —
-```bash
-sudo ipset list weddos_block
-```
-
-Q — *How to remove a single blocked IP?*  
-A —
-```bash
-sudo ipset del weddos_block 1.2.3.4
-```
-
-Q — *Rules not present after restart?*  
-A — If running as script manually, rules persist only while ipset/iptables entries exist; ensure you use the systemd service or a start-up script. If kernel modules for `ipset` or `xt_conntrack` are missing, install required kernel modules or package `iptables` extensions.
-
-Q — *Discord notifications not sent?*  
-A — Set `DISCORD_WEBHOOK` and verify `requests` is installed. Test by running simple `curl`/`requests` POST to your webhook.
-
-Q — *I want to tune per-service rates (example Minecraft).*  
-A — Add specific port to `WHITELIST_PORTS` if you want to avoid automated per-port limits. Or adjust `HASHLIMIT_RATE`, `SYN_RATE`, and `MAX_CONN_PER_IP` accordingly.
-
----
-
-# Notes & Warnings
-
-- **Root required**: This script runs privileged networking commands and **must** be run as `root`.  
-- **Test first**: Try in a staging environment or during maintenance window. Mistuned rules can disrupt legitimate traffic.  
-- **Compatibility**: Written against `iptables` legacy toolchain. If your environment uses `nftables` only, adapt logic to nft or install `iptables-legacy`.  
-- **Not a replacement for upstream mitigation**: For large volumetric attacks (Gbit/s), use provider/anti-DDoS (Cloud provider, Cloudflare Spectrum, dedicated scrubbing centers). This script is best for low-to-medium attacks and behavior-based mitigation.  
-- **Do not run multiple automated firewall scripts simultaneously** — they may conflict.
-
----
-
-# Example Commands (quick reference)
-
-```bash
-# Start manually
-sudo python3 /opt/weddos/weddos_guard.py
-
-# Start via systemd
-sudo systemctl enable --now weddos.service
-sudo systemctl status weddos.service
-sudo journalctl -u weddos.service -f
-
-# List ipset blocks
-sudo ipset list weddos_block
-
-# Remove ipset block (single IP)
-sudo ipset del weddos_block 1.2.3.4
-
-# View WEDDOS chain rules
-sudo iptables -S WEDDOS-PORT
-
-# Flush and remove WEDDOS chain (careful):
-sudo iptables -D INPUT -j WEDDOS-PORT 2>/dev/null || true
-sudo iptables -F WEDDOS-PORT
-sudo iptables -X WEDDOS-PORT
-sudo ipset flush weddos_block
-sudo ipset destroy weddos_block
-```
-
----
-
-# Contributing
-- Improvements, PRs and issue reports are welcome. Please:
-  - Keep `sysctl` changes explicit and documented.
-  - Add tests for `ss/netstat` parsing using sample outputs.
-  - Provide optional config-file support or environment-variable driven config (future enhancement).
-
----
-
-# License & Credits
-**MIT License** — see `LICENSE` file.  
-Developed by **WeThink**.
-
----
-
-If you want, I can:
-- add a ready-to-use `weddos.service` file in the repo,  
-- create a `/etc/weddos/weddos.conf` external configuration loader (so you don't edit the script directly), or  
-- generate a minimal `Dockerfile` + README notes for the container approach.
-
-Which of those would you like next?
+This script is provided as-is, without warranty. Feel free to modify and use under MIT License. Contributions welcome!
