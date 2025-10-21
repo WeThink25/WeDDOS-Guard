@@ -1,462 +1,832 @@
 #!/usr/bin/env python3
 """
-WeDDOS Guard v3.3 - Optimized for 100+ concurrent Minecraft players
-- Improvements: interface autodetect, reduced subprocess overhead, local blocked-set, batching
-- NOTE: test on staging first. Run as root.
+WeDDOS Guard - Advanced DDoS Protection System
+Protects servers using iptables with rate limiting and auto port detection
+Minecraft Server Compatible (TCP/UDP)
+Discord Webhook Integration for logging and alerts
+Configurable settings and port whitelisting
 """
 
 import subprocess
-import time
+import socket
 import re
-import os
 import sys
+import time
+import argparse
+import json
 import requests
-import signal
 from datetime import datetime
+from collections import defaultdict
 
-# ================= CONFIG - THRESHOLDS & TIMERS ===================
-CHECK_INTERVAL = 4                 # seconds between main loop iterations (tuned for lower overhead)
-BLOCK_TIME = 600                   # ipset timeout (seconds)
-CONN_THRESHOLD = 200               # per-IP simultaneous connections threshold (was 500)
-REPEAT_HITCOUNT = 3                # how many loops an IP must appear before block
-BATCH_ADD_LIMIT = 10               # max ipset adds per loop to avoid churn
+# ============================================================================
+# CONFIGURATION SETTINGS - EDIT THESE VALUES
+# ============================================================================
 
-# --- IPSET NAMES ---
-IPSET_DYNAMIC_BLOCK = "weddos_block"
-IPSET_DATACENTER_BLOCK = "datacenter_block"
-IPSET_BAD_LIST_BLOCK = "bad_list_block"
-CHAIN_NAME = "WEDDOS-PORT"
-RAW_CHAIN_NAME = "WEDDOS-RAW"
+CONFIG = {
+    # Discord Webhook URL (leave empty to disable Discord notifications)
+    'DISCORD_WEBHOOK_URL': '',
+    
+    # Whitelisted ports (these ports will NEVER be rate-limited or blocked)
+    # Common ports: 22 (SSH), 80 (HTTP), 443 (HTTPS)
+    'WHITELISTED_PORTS': [22, 80, 443],
+    
+    # Rate limiting settings
+    'DEFAULT_RATE_LIMIT': 100,          # Connections per second
+    'DEFAULT_BURST_LIMIT': 200,         # Burst tolerance
+    'SYN_FLOOD_RATE': 10,               # SYN packets per second
+    'SYN_FLOOD_BURST': 50,              # SYN burst tolerance
+    'ICMP_RATE_LIMIT': 1,               # Ping requests per second
+    'ICMP_BURST': 2,                    # Ping burst tolerance
+    'RST_RATE_LIMIT': 2,                # RST packets per second
+    'RST_BURST': 2,                     # RST burst tolerance
+    
+    # Minecraft specific settings
+    'MINECRAFT_TCP_RATE': 50,           # TCP connections per second
+    'MINECRAFT_TCP_BURST': 100,         # TCP burst limit
+    'MINECRAFT_UDP_RATE': 100,          # UDP packets per second
+    'MINECRAFT_UDP_BURST': 150,         # UDP burst limit
+    'MINECRAFT_MAX_CONN_PER_IP': 3,     # Max simultaneous connections per IP
+    
+    # Attack detection thresholds
+    'ATTACK_THRESHOLD': 1000,           # Packets dropped to consider it an attack
+    'MONITOR_INTERVAL': 60,             # Seconds between monitoring checks
+    'STATS_REPORT_INTERVAL': 10,        # Send stats every N checks
+    
+    # Connection tracking
+    'CONNTRACK_MAX': 100000,            # Maximum tracked connections
+    
+    # Logging
+    'LOG_LEVEL': 'INFO',                # INFO, WARNING, ERROR, CRITICAL
+    'VERBOSE_LOGGING': True,            # Detailed logging
+    
+    # Advanced protection features
+    'ENABLE_GEO_BLOCKING': False,       # Enable country-based blocking (requires geoip)
+    'BLOCKED_COUNTRIES': [],            # Country codes to block (e.g., ['CN', 'RU'])
+    'ENABLE_FAIL2BAN_INTEGRATION': False,  # Work with fail2ban
+    
+    # Automatic features
+    'AUTO_SAVE_RULES': True,            # Automatically save rules on exit
+    'AUTO_DETECT_PORTS': True,          # Auto-detect open ports on startup
+    'PROTECT_MINECRAFT_AUTO': True,     # Auto-protect Minecraft ports if detected
+}
 
-# --- STATIC BLOCKLIST SOURCES ---
-DATACENTER_IP_LIST_URL = "https://raw.githubusercontent.com/jhassine/server-ip-addresses/master/data/datacenters.txt"
-GENERIC_BAD_IP_LIST_URL = "https://lists.blocklist.de/lists/all.txt"
+# ============================================================================
+# END OF CONFIGURATION
+# ============================================================================
 
-# --- LOG & BRUTE FORCE ---
-AUTH_LOG_FILE = "/var/log/auth.log"
-BRUTE_FORCE_FAILS = 5
-LOG_POS_FILE = "/tmp/.weddos_auth_log_pos"
-
-# --- PORTS & LIMITS ---
-WHITELIST_PORTS = {22, 53, 80, 443, 25565}  # include Minecraft default port; adjust if yours differs
-MAX_CONN_PER_IP = 30               # per-IP connlimit - lower because single players don't need many connections
-HASHLIMIT_RATE = "20/min"
-HASHLIMIT_BURST = 10
-ICMP_RATE = "10/second"
-ICMP_BURST = 20
-SYN_RATE = "200/second"
-SYN_BURST = 500
-UDP_RATE = "2000/second"
-UDP_BURST = 1000
-GLOBAL_NEW_CONN_WARNING = 1500    # raise if your normal baseline traffic is higher
-PORT_SCAN_THRESHOLD = 5
-DISCORD_WEBHOOK = ""               # set your webhook to enable
-
-# --- SAFETY MODE ---
-LEARN_MODE = False                 # if True: no ipset adds for first 24h; script only observes
-LEARN_DURATION = 24 * 60 * 60
-
-# ===========================================
-offender_counts = {}
-escalated = False
-blocked_ips = set()                # local cache of blocked IPs to avoid repeated ipset add
-_escalation_start_ts = None
-_escalation_blocked_ips = set()
-start_time = time.time()
-
-# Precompile regexes for speed
-RE_SSH_FAIL = re.compile(r'Failed password for .* from (\d+\.\d+\.\d+\.\d+) port \d+ ssh2')
-RE_IP = re.compile(r'(\d+\.\d+\.\d+\.\d+):\d+')
-
-def run(cmd):
-    """Execute shell command and return stdout."""
-    return subprocess.getoutput(cmd)
-
-def log(msg):
-    print(f"[WeDDOS] {time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
-
-def send_discord(content):
-    if not DISCORD_WEBHOOK:
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK, json={"content": content}, timeout=5)
-    except Exception as e:
-        log(f"Discord notify failed: {e}")
-
-def detect_external_interface():
-    """Try to detect the external interface name (best-effort)."""
-    try:
-        out = run("ip route get 1.1.1.1 2>/dev/null || true")
-        m = re.search(r'dev (\S+)', out)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    # fallback list
-    for iface in ("eth0", "ens3", "ens5", "enp1s0", "eth1"):
-        if os.path.exists(f"/sys/class/net/{iface}"):
-            return iface
-    return "eth0"
-
-EXTERNAL_IFACE = detect_external_interface()
-log(f"Detected external interface: {EXTERNAL_IFACE}")
-
-def iptables_has(rule_fragment, chain="INPUT", table="filter"):
-    try:
-        out = run(f"iptables -t {table} -S {chain} 2>/dev/null || true")
-        return rule_fragment in out
-    except Exception:
-        return False
-
-def apply_sysctl_hardening():
-    tweaks = {
-        "net.ipv4.tcp_syncookies": "1",
-        "net.netfilter.nf_conntrack_tcp_loose": "0",
-    }
-    for k, v in tweaks.items():
-        run(f"sysctl -w {k}={v}")
-    log("Applied sysctl kernel hardening.")
-
-def ensure_ipset():
-    run(f"ipset create {IPSET_DYNAMIC_BLOCK} hash:ip timeout {BLOCK_TIME} -exist")
-    run(f"ipset create {IPSET_DATACENTER_BLOCK} hash:net family inet -exist")
-    run(f"ipset create {IPSET_BAD_LIST_BLOCK} hash:ip family inet -exist")
-
-    # link sets into INPUT
-    dc_fragment = f"-m set --match-set {IPSET_DATACENTER_BLOCK} src -j DROP"
-    if not iptables_has(dc_fragment, "INPUT", "filter"):
-        run(f"iptables -I INPUT 2 -m set --match-set {IPSET_DATACENTER_BLOCK} src -j DROP")
-
-    bad_fragment = f"-m set --match-set {IPSET_BAD_LIST_BLOCK} src -j DROP"
-    if not iptables_has(bad_fragment, "INPUT", "filter"):
-        run(f"iptables -I INPUT 3 -m set --match-set {IPSET_BAD_LIST_BLOCK} src -j DROP")
-
-    dyn_fragment = f"-m set --match-set {IPSET_DYNAMIC_BLOCK} src -j DROP"
-    if not iptables_has(dyn_fragment, "INPUT", "filter"):
-        run(f"iptables -I INPUT 4 -m set --match-set {IPSET_DYNAMIC_BLOCK} src -j DROP")
-
-    log("ipsets ensured and linked.")
-
-def fetch_and_block_ip_lists():
-    def fetch_list(url, ipset_name, description):
-        if not url:
-            log(f"{description} URL empty; skip.")
+class DiscordWebhook:
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+        self.enabled = bool(webhook_url)
+        
+    def send_message(self, title, description, color=0x00ff00, fields=None):
+        """Send embed message to Discord"""
+        if not self.enabled:
             return
+        
         try:
-            log(f"Fetching {description}...")
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            items = r.text.splitlines()
-            cnt = 0
-            for item in items:
-                s = item.strip()
-                if not s or s.startswith('#'):
-                    continue
-                run(f"ipset add {ipset_name} {s} -exist 2>/dev/null || true")
-                cnt += 1
-            log(f"Loaded {cnt} entries to {ipset_name}.")
+            embed = {
+                "title": title,
+                "description": description,
+                "color": color,
+                "timestamp": datetime.utcnow().isoformat(),
+                "footer": {
+                    "text": "WeDDOS Guard"
+                }
+            }
+            
+            if fields:
+                embed["fields"] = fields
+            
+            payload = {
+                "embeds": [embed]
+            }
+            
+            response = requests.post(
+                self.webhook_url,
+                json=payload,
+                timeout=10
+            )
+            
+            if response.status_code not in [200, 204]:
+                print(f"[WARNING] Discord webhook failed: {response.status_code}")
+                
         except Exception as e:
-            log(f"Failed to fetch {description}: {e}")
+            print(f"[WARNING] Failed to send Discord message: {str(e)}")
+    
+    def send_alert(self, message, level="INFO"):
+        """Send alert message with color coding"""
+        colors = {
+            "INFO": 0x3498db,      # Blue
+            "SUCCESS": 0x2ecc71,   # Green
+            "WARNING": 0xf39c12,   # Orange
+            "ERROR": 0xe74c3c,     # Red
+            "CRITICAL": 0x992d22   # Dark Red
+        }
+        
+        self.send_message(
+            title=f"🛡️ WeDDOS Guard - {level}",
+            description=message,
+            color=colors.get(level, 0x95a5a6)
+        )
+    
+    def send_attack_alert(self, attack_type, source_ip, port, packets_dropped):
+        """Send detailed attack alert"""
+        fields = [
+            {"name": "⚠️ Attack Type", "value": attack_type, "inline": True},
+            {"name": "🌐 Source IP", "value": source_ip, "inline": True},
+            {"name": "🔌 Target Port", "value": str(port), "inline": True},
+            {"name": "🚫 Packets Dropped", "value": str(packets_dropped), "inline": True}
+        ]
+        
+        self.send_message(
+            title="🚨 ATTACK DETECTED",
+            description="Potential DDoS attack blocked by WeDDOS Guard",
+            color=0xe74c3c,
+            fields=fields
+        )
+    
+    def send_statistics(self, protected_ports, whitelisted_ports, total_dropped, uptime):
+        """Send statistics summary"""
+        fields = [
+            {"name": "🔒 Protected Ports", "value": str(len(protected_ports)), "inline": True},
+            {"name": "✅ Whitelisted Ports", "value": str(len(whitelisted_ports)), "inline": True},
+            {"name": "🚫 Total Dropped", "value": str(total_dropped), "inline": True},
+            {"name": "⏱️ Uptime", "value": uptime, "inline": True},
+            {"name": "📋 Protected", "value": ", ".join(map(str, protected_ports)) if protected_ports else "None", "inline": False},
+            {"name": "✅ Whitelisted", "value": ", ".join(map(str, whitelisted_ports)), "inline": False}
+        ]
+        
+        self.send_message(
+            title="📊 Protection Statistics",
+            description="Current WeDDOS Guard status report",
+            color=0x3498db,
+            fields=fields
+        )
 
-    fetch_list(DATACENTER_IP_LIST_URL, IPSET_DATACENTER_BLOCK, "datacenter IPs")
-    fetch_list(GENERIC_BAD_IP_LIST_URL, IPSET_BAD_LIST_BLOCK, "generic bad IPs")
-
-def ensure_chains():
-    est_frag = "-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
-    if not iptables_has(est_frag, "INPUT", "filter"):
-        run(f"iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
-
-    # create chain if missing
-    existing = run("iptables -S | sed -n 's/^-N \\(.*\\)/\\1/p' || true")
-    if CHAIN_NAME not in existing:
-        run(f"iptables -N {CHAIN_NAME}")
-    if f"-j {CHAIN_NAME}" not in run("iptables -S INPUT || true"):
-        run(f"iptables -I INPUT 5 -j {CHAIN_NAME}")
-
-    # raw chain
-    raw_ch = run("iptables -t raw -S | sed -n 's/^-N \\(.*\\)/\\1/p' || true")
-    if RAW_CHAIN_NAME not in raw_ch:
-        run(f"iptables -t raw -N {RAW_CHAIN_NAME}")
-    if f"-j {RAW_CHAIN_NAME}" not in run("iptables -t raw -S PREROUTING || true"):
-        run(f"iptables -t raw -I PREROUTING 1 -j {RAW_CHAIN_NAME}")
-
-    log("Chains ready.")
-
-def apply_raw_filters():
-    raw_rules = [
-        f"-i {EXTERNAL_IFACE} -s 224.0.0.0/4 -j DROP",
-        f"-i {EXTERNAL_IFACE} -s 169.254.0.0/16 -j DROP",
-        f"-i {EXTERNAL_IFACE} -s 0.0.0.0/8 -j DROP",
-        f"-i {EXTERNAL_IFACE} -s 240.0.0.0/5 -j DROP",
-        "-p tcp -m conntrack --ctstate INVALID -j DROP",
-        "-p tcp -m conntrack --ctstate NEW ! --syn -j DROP",
-    ]
-    for r in raw_rules:
-        if not iptables_has(r, RAW_CHAIN_NAME, "raw"):
-            run(f"iptables -t raw -A {RAW_CHAIN_NAME} {r}")
-    if not iptables_has("-j RETURN", RAW_CHAIN_NAME, "raw"):
-        run(f"iptables -t raw -A {RAW_CHAIN_NAME} -j RETURN")
-    log("Applied raw filters.")
-
-def apply_global_filters():
-    ttl_frag = "-m ttl --ttl-eq 0 -j DROP"
-    if not iptables_has(ttl_frag, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {ttl_frag}")
-
-    base_rules = [
-        "-f -j DROP",
-        "-p tcp -m conntrack --ctstate NEW -m tcp --tcp-flags ACK ACK -j DROP",
-        "-p tcp -m conntrack --ctstate NEW -m tcp ! --tcp-flags FIN,SYN,RST,PSH,ACK SYN -j DROP",
-        "-p tcp -m tcp --tcp-flags ALL FIN,PSH,URG -j DROP",
-        "-p tcp -m tcp --tcp-flags ALL NONE -j DROP",
-        "-p tcp -m tcp --tcp-flags ALL ALL -j DROP",
-        "-p tcp -m tcp --tcp-flags FIN FIN -j DROP",
-    ]
-    for r in base_rules:
-        if not iptables_has(r, CHAIN_NAME, "filter"):
-            run(f"iptables -A {CHAIN_NAME} {r}")
-
-    syn_fin_frag = "-p tcp -m tcp --tcp-flags SYN,FIN SYN,FIN -m limit --limit 1/s --limit-burst 2 -j ACCEPT"
-    if not iptables_has(syn_fin_frag, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {syn_fin_frag}")
-        run(f"iptables -A {CHAIN_NAME} -p tcp -m tcp --tcp-flags SYN,FIN SYN,FIN -j DROP")
-
-    syn_rst_frag = "-p tcp -m tcp --tcp-flags SYN,RST SYN,RST -m limit --limit 1/s --limit-burst 2 -j ACCEPT"
-    if not iptables_has(syn_rst_frag, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {syn_rst_frag}")
-        run(f"iptables -A {CHAIN_NAME} -p tcp -m tcp --tcp-flags SYN,RST SYN,RST -j DROP")
-
-    syn_ack_frag = f"-p tcp --tcp-flags SYN,ACK SYN,ACK -m limit --limit {SYN_RATE} --limit-burst {SYN_BURST} -j ACCEPT"
-    if not iptables_has(syn_ack_frag, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {syn_ack_frag}")
-
-    port_scan_frag = ("-p tcp -m conntrack --ctstate NEW -m recent --name PORT_SCANNER --set --rsource "
-                      f"-m recent --name PORT_SCANNER --update --seconds 60 --hitcount {PORT_SCAN_THRESHOLD} -j SET --add-set {IPSET_DYNAMIC_BLOCK} src --exist")
-    if not iptables_has(port_scan_frag, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {port_scan_frag}")
-
-    icmp_frag = f"-p icmp -m limit --limit {ICMP_RATE} --limit-burst {ICMP_BURST} -j ACCEPT"
-    if not iptables_has(icmp_frag, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {icmp_frag}")
-    icmp_return = "-p icmp -j RETURN"
-    if not iptables_has(icmp_return, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {icmp_return}")
-
-    log("Applied global filters.")
-
-def check_log_for_bruteforce():
-    if not os.path.exists(AUTH_LOG_FILE):
-        return
-    pos = 0
-    if os.path.exists(LOG_POS_FILE):
+class WeDDOSGuard:
+    def __init__(self, config=None, webhook_url=None):
+        self.config = config or CONFIG
+        self.protected_ports = []
+        self.whitelisted_ports = self.config['WHITELISTED_PORTS'].copy()
+        self.minecraft_ports = [25565]
+        
+        # Use webhook from config or parameter
+        webhook = webhook_url or self.config.get('DISCORD_WEBHOOK_URL')
+        self.discord = DiscordWebhook(webhook)
+        
+        self.start_time = datetime.now()
+        self.attack_counts = defaultdict(int)
+        self.last_stats = {}
+        
+    def log(self, message, level="INFO"):
+        """Log messages with timestamp and send to Discord"""
+        if self.config.get('LOG_LEVEL') == 'ERROR' and level == 'INFO':
+            return
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] [{level}] {message}"
+        print(log_message)
+        
+        # Send to Discord for important messages
+        if level in ["SUCCESS", "WARNING", "ERROR", "CRITICAL"]:
+            self.discord.send_alert(message, level)
+    
+    def check_root(self):
+        """Check if script is running with root privileges"""
+        if subprocess.call(['id', '-u'], stdout=subprocess.DEVNULL) != 0:
+            return False
+        result = subprocess.run(['id', '-u'], capture_output=True, text=True)
+        return result.stdout.strip() == '0'
+    
+    def run_command(self, command):
+        """Execute shell command safely"""
         try:
-            with open(LOG_POS_FILE, 'r') as f:
-                pos = int(f.read().strip() or 0)
-        except Exception:
-            pos = 0
-    try:
-        current_size = int(run(f"wc -c < {AUTH_LOG_FILE}").strip())
-    except Exception:
-        current_size = os.path.getsize(AUTH_LOG_FILE) if os.path.exists(AUTH_LOG_FILE) else 0
-    try:
-        with open(AUTH_LOG_FILE, 'r') as f:
-            f.seek(pos)
-            lines = f.readlines()
-            failed = {}
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=10)
+            return result.returncode == 0, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            self.log(f"Command timed out: {command}", "ERROR")
+            return False, "", "Timeout"
+        except Exception as e:
+            self.log(f"Command failed: {str(e)}", "ERROR")
+            return False, "", str(e)
+    
+    def detect_open_ports(self):
+        """Detect open listening ports on the system"""
+        self.log("Detecting open ports...")
+        open_ports = []
+        
+        success, output, _ = self.run_command("netstat -tuln 2>/dev/null || ss -tuln")
+        
+        if success and output:
+            lines = output.split('\n')
             for line in lines:
-                m = RE_SSH_FAIL.search(line)
-                if m:
-                    ip = m.group(1)
-                    failed[ip] = failed.get(ip, 0) + 1
-            for ip, cnt in failed.items():
-                if cnt >= BRUTE_FORCE_FAILS:
-                    block_ip(ip, reason=f"SSH brute-force ({cnt} failures)")
-        with open(LOG_POS_FILE, 'w') as f:
-            f.write(str(current_size))
-    except Exception as e:
-        log(f"Auth log read error: {e}")
-
-def get_attackers():
-    """
-    Efficient parsing: run ss once and scan for ip occurrences and SYN states.
-    Returns attackers list [(ip, count)], total_new_conn approximation.
-    """
-    out = run("ss -nt state syn-recv,syn-sent || true")
-    ip_counts = {}
-    total_new_conn = 0
-    for line in out.splitlines():
-        # fast check for SYN words
-        if 'SYN' in line:
-            total_new_conn += 1
-        m = RE_IP.search(line)
-        if not m:
-            continue
-        ip = m.group(1)
-        ip_counts[ip] = ip_counts.get(ip, 0) + 1
-    attackers = [(ip, cnt) for ip, cnt in ip_counts.items() if cnt >= CONN_THRESHOLD]
-    # also return top N high-connection IPs if needed
-    return attackers, total_new_conn
-
-def ipset_members(ipset_name):
-    out = run(f"ipset list {ipset_name} -o save 2>/dev/null || true")
-    members = []
-    for l in out.splitlines():
-        if l.startswith("add "):
-            parts = l.split()
-            if len(parts) >= 3:
-                members.append(parts[2])
-    return members
-
-def block_ip_immediate(ip):
-    """Actually add IP to ipset (idempotent with -exist)."""
-    run(f"ipset add {IPSET_DYNAMIC_BLOCK} {ip} timeout {BLOCK_TIME} -exist 2>/dev/null || true")
-    blocked_ips.add(ip)
-    _escalation_blocked_ips.add(ip)
-    log(f"ipset add {ip} (timeout {BLOCK_TIME}s)")
-
-def block_ip_safe(ip, reason=None):
-    """Wrap block with learn-mode and throttling."""
-    if LEARN_MODE and (time.time() - start_time) < LEARN_DURATION:
-        log(f"[LEARN MODE] Not blocking {ip} ({reason})")
-        return
-    if ip in blocked_ips:
-        return
-    block_ip_immediate(ip)
-    # optional Discord per-IP notification
-    send_discord(f"🚨 WeDDOS Guard: Blocked `{ip}` — reason: {reason or 'threshold'}")
-
-def block_ip(ip):
-    """Public wrapper to mark offender counts and block if needed (keeps repeat logic)."""
-    block_ip_safe(ip, reason="auto")
-
-def escalate_global(total_new_conn=0):
-    global escalated, _escalation_start_ts, _escalation_blocked_ips
-    if escalated:
-        return
-    escalated = True
-    _escalation_start_ts = time.time()
-    _escalation_blocked_ips = set()
-    run(f"iptables -I {CHAIN_NAME} 1 -m conntrack --ctstate NEW -m limit --limit 50/second --limit-burst 100 -j RETURN")
-    send_discord(f"🚨 **Attack Started** — observed new-connections ≈ `{total_new_conn}`. Global throttling applied.")
-    log("Global escalation inserted.")
-
-def relax_global():
-    global escalated, _escalation_start_ts, _escalation_blocked_ips
-    if not escalated:
-        return
-    escalated = False
-    # remove escalation rule
-    lines = run(f"iptables -S {CHAIN_NAME} || true").splitlines()
-    for l in lines:
-        if "--limit 50/second" in l and "--ctstate NEW" in l:
-            to_del = l.replace(f"-A {CHAIN_NAME} ", "")
-            run(f"iptables -D {CHAIN_NAME} {to_del} 2>/dev/null || true")
-            break
-    # compile summary
-    members = ipset_members(IPSET_DYNAMIC_BLOCK)
-    combined = sorted(list(_escalation_blocked_ips | set(members)))
-    total_blocked = len(combined)
-    shown = ", ".join(combined[:100]) if total_blocked else "None"
-    duration = int(time.time() - (_escalation_start_ts or time.time()))
-    send_discord(f"✅ **Attack Ended / Migrated** — duration: `{duration}`s — blocked IPs (first {min(100, total_blocked)}): `{shown}` — total `{total_blocked}`")
-    log("Global escalation removed and summary sent.")
-    _escalation_start_ts = None
-    _escalation_blocked_ips = set()
-
-def apply_port_protections(port):
-    # mangle rule
-    mangle_frag = f"-p tcp --dport {port} -m conntrack --ctstate NEW -j TCPMSS --clamp-mss-to-pmtu"
-    if not iptables_has(mangle_frag, "PREROUTING", "mangle"):
-        run(f"iptables -t mangle -I PREROUTING -p tcp --dport {port} -m conntrack --ctstate NEW -j TCPMSS --clamp-mss-to-pmtu")
-    cl = f"-p tcp --dport {port} -m connlimit --connlimit-above {MAX_CONN_PER_IP} --connlimit-mask 32 -j REJECT --reject-with tcp-reset"
-    if not iptables_has(cl, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {cl}")
-    hl = (f"-p tcp --dport {port} -m conntrack --ctstate NEW -m hashlimit --hashlimit-name hl_new_{port} "
-          f"--hashlimit-above {HASHLIMIT_RATE} --hashlimit-burst {HASHLIMIT_BURST} --hashlimit-mode srcip --hashlimit-srcmask 32 -j SET --add-set {IPSET_DYNAMIC_BLOCK} src --exist")
-    if not iptables_has(hl, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {hl} 2>/dev/null || true")
-    syn = f"-p tcp --dport {port} --syn -m conntrack --ctstate NEW -m limit --limit {SYN_RATE} --limit-burst {SYN_BURST} -j ACCEPT"
-    if not iptables_has(syn, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {syn}")
-    syn_ret = f"-p tcp --dport {port} --syn -m conntrack --ctstate NEW -j RETURN"
-    if not iptables_has(syn_ret, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {syn_ret}")
-    udp = f"-p udp --dport {port} -m limit --limit {UDP_RATE} --limit-burst {UDP_BURST} -j ACCEPT"
-    if not iptables_has(udp, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {udp}")
-    udp_ret = f"-p udp --dport {port} -j RETURN"
-    if not iptables_has(udp_ret, CHAIN_NAME, "filter"):
-        run(f"iptables -A {CHAIN_NAME} {udp_ret}")
-    log(f"Applied protections for port {port}")
-
-def cleanup(signum, frame):
-    log("Exiting. Rules left intact.")
-    sys.exit(0)
+                match = re.search(r'(tcp|udp)\s+\d+\s+\d+\s+[\d\.:]+:(\d+)', line.lower())
+                if match:
+                    port = int(match.group(2))
+                    if port not in open_ports and port > 0:
+                        open_ports.append(port)
+        
+        for port in self.minecraft_ports:
+            if self.check_port_open(port) and port not in open_ports:
+                open_ports.append(port)
+        
+        open_ports.sort()
+        self.log(f"Detected open ports: {open_ports}")
+        
+        # Send to Discord
+        if open_ports:
+            fields = [
+                {"name": "🔍 Detected Ports", "value": ", ".join(map(str, open_ports)), "inline": False},
+                {"name": "📊 Total Count", "value": str(len(open_ports)), "inline": True}
+            ]
+            self.discord.send_message(
+                title="🔎 Port Detection Complete",
+                description="Open ports detected on the system",
+                color=0x3498db,
+                fields=fields
+            )
+        
+        return open_ports
+    
+    def check_port_open(self, port):
+        """Check if a specific port is open"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        try:
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            return result == 0
+        except:
+            return False
+    
+    def check_existing_rules(self):
+        """Check for existing iptables rules"""
+        self.log("Checking existing firewall rules...")
+        success, output, _ = self.run_command("iptables -L -n")
+        
+        if success:
+            rule_count = len([l for l in output.split('\n') if l.strip() and not l.startswith('Chain') and not l.startswith('target')])
+            self.log(f"Found {rule_count} existing iptables rules (will be preserved)")
+            
+            fields = [
+                {"name": "📜 Existing Rules", "value": str(rule_count), "inline": True},
+                {"name": "✅ Status", "value": "Rules preserved", "inline": True}
+            ]
+            self.discord.send_message(
+                title="🔧 Firewall Status",
+                description="Existing firewall rules detected and preserved",
+                color=0x3498db,
+                fields=fields
+            )
+            
+            return rule_count
+        return 0
+    
+    def setup_whitelist_rules(self):
+        """Setup rules to whitelist important ports"""
+        self.log("Setting up whitelist for critical ports...")
+        
+        whitelisted_count = 0
+        for port in self.whitelisted_ports:
+            # Accept all traffic on whitelisted ports (both TCP and UDP)
+            rules = [
+                f"iptables -A INPUT -p tcp --dport {port} -j ACCEPT",
+                f"iptables -A INPUT -p udp --dport {port} -j ACCEPT"
+            ]
+            
+            for rule in rules:
+                success, _, _ = self.run_command(rule)
+                if success:
+                    whitelisted_count += 1
+        
+        self.log(f"Whitelisted {len(self.whitelisted_ports)} ports: {self.whitelisted_ports}", "SUCCESS")
+        
+        # Send to Discord
+        fields = [
+            {"name": "✅ Whitelisted Ports", "value": ", ".join(map(str, self.whitelisted_ports)), "inline": False},
+            {"name": "🛡️ Protection", "value": "No rate limiting applied", "inline": True}
+        ]
+        self.discord.send_message(
+            title="✅ Port Whitelist Active",
+            description="Critical ports are whitelisted and fully accessible",
+            color=0x2ecc71,
+            fields=fields
+        )
+    
+    def setup_base_protection(self):
+        """Setup base iptables protection rules"""
+        self.log("Setting up base protection rules...")
+        
+        # Get configured values
+        syn_rate = self.config.get('SYN_FLOOD_RATE', 10)
+        syn_burst = self.config.get('SYN_FLOOD_BURST', 50)
+        icmp_rate = self.config.get('ICMP_RATE_LIMIT', 1)
+        icmp_burst = self.config.get('ICMP_BURST', 2)
+        rst_rate = self.config.get('RST_RATE_LIMIT', 2)
+        rst_burst = self.config.get('RST_BURST', 2)
+        
+        rules = [
+            # CRITICAL: Accept established and related connections FIRST
+            "iptables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT",
+            
+            # Accept loopback (localhost)
+            "iptables -A INPUT -i lo -j ACCEPT",
+            
+            # Drop invalid packets (but not established connections)
+            "iptables -A INPUT -m state --state INVALID -j DROP",
+            
+            # Protection against SYN flood (configurable)
+            "iptables -N syn_flood 2>/dev/null || true",
+            "iptables -F syn_flood 2>/dev/null || true",
+            f"iptables -A syn_flood -m limit --limit {syn_rate}/s --limit-burst {syn_burst} -j RETURN",
+            "iptables -A syn_flood -j DROP",
+            "iptables -A INPUT -p tcp --syn -m state --state NEW -j syn_flood",
+            
+            # Drop fragmented packets
+            "iptables -A INPUT -f -j DROP",
+            
+            # Drop XMAS packets
+            "iptables -A INPUT -p tcp --tcp-flags ALL ALL -j DROP",
+            
+            # Drop NULL packets
+            "iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP",
+            
+            # Drop excessive RST packets (configurable)
+            f"iptables -A INPUT -p tcp --tcp-flags RST RST -m limit --limit {rst_rate}/s --limit-burst {rst_burst} -j ACCEPT",
+            "iptables -A INPUT -p tcp --tcp-flags RST RST -j DROP",
+            
+            # Limit ICMP (ping) requests (configurable)
+            f"iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit {icmp_rate}/s --limit-burst {icmp_burst} -j ACCEPT",
+            "iptables -A INPUT -p icmp --icmp-type echo-request -j DROP",
+            
+            # Protection against port scanning
+            "iptables -N port_scan 2>/dev/null || true",
+            "iptables -F port_scan 2>/dev/null || true",
+            "iptables -A port_scan -p tcp --tcp-flags SYN,ACK,FIN,RST RST -m limit --limit 1/s --limit-burst 2 -j RETURN",
+            "iptables -A port_scan -j DROP"
+        ]
+        
+        applied_rules = 0
+        failed_rules = 0
+        
+        for rule in rules:
+            success, _, stderr = self.run_command(rule)
+            if success or "already exists" in stderr.lower():
+                applied_rules += 1
+            else:
+                failed_rules += 1
+                if "already exists" not in stderr.lower() and self.config.get('VERBOSE_LOGGING'):
+                    self.log(f"Failed to apply rule: {rule}", "WARNING")
+        
+        self.log(f"Base protection setup complete: {applied_rules} rules applied", "SUCCESS")
+        
+        # Send summary to Discord
+        fields = [
+            {"name": "✅ Applied Rules", "value": str(applied_rules), "inline": True},
+            {"name": "❌ Failed Rules", "value": str(failed_rules), "inline": True},
+            {"name": "🛡️ Protection Level", "value": "Enhanced", "inline": True},
+            {"name": "⚙️ SYN Flood Rate", "value": f"{syn_rate}/s (burst: {syn_burst})", "inline": True},
+            {"name": "🏓 ICMP Rate", "value": f"{icmp_rate}/s (burst: {icmp_burst})", "inline": True}
+        ]
+        self.discord.send_message(
+            title="🔒 Base Protection Activated",
+            description="Core DDoS protection rules applied. Established connections are preserved.",
+            color=0x2ecc71,
+            fields=fields
+        )
+    
+    def protect_port(self, port, protocol="both", rate_limit=None, burst=None):
+        """Apply DDoS protection to a specific port"""
+        
+        # Skip if port is whitelisted
+        if port in self.whitelisted_ports:
+            self.log(f"Port {port} is whitelisted, skipping protection", "INFO")
+            return
+        
+        # Use config defaults if not specified
+        if rate_limit is None:
+            rate_limit = self.config.get('DEFAULT_RATE_LIMIT', 100)
+        if burst is None:
+            burst = self.config.get('DEFAULT_BURST_LIMIT', 200)
+        
+        self.log(f"Protecting port {port} ({protocol}) - Rate: {rate_limit}/s, Burst: {burst}...")
+        
+        protocols = ['tcp', 'udp'] if protocol == 'both' else [protocol]
+        
+        for proto in protocols:
+            chain_name = f"PORT_{port}_{proto.upper()}"
+            self.run_command(f"iptables -N {chain_name} 2>/dev/null || iptables -F {chain_name}")
+            
+            rules = [
+                # Allow established connections
+                f"iptables -A {chain_name} -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                # Track new connections
+                f"iptables -A {chain_name} -m state --state NEW -m recent --set --name {chain_name}_track",
+                # Rate limit new connections
+                f"iptables -A {chain_name} -m state --state NEW -m recent --update --seconds 1 --hitcount {rate_limit} --name {chain_name}_track -j DROP",
+                # Burst limit
+                f"iptables -A {chain_name} -m limit --limit {rate_limit}/s --limit-burst {burst} -j ACCEPT",
+                # Drop excess
+                f"iptables -A {chain_name} -j DROP"
+            ]
+            
+            for rule in rules:
+                self.run_command(rule)
+            
+            # Direct traffic to the chain (only for NEW connections)
+            self.run_command(f"iptables -A INPUT -p {proto} --dport {port} -m state --state NEW -j {chain_name}")
+            
+        self.protected_ports.append(port)
+        self.log(f"Port {port} is now protected", "SUCCESS")
+        
+        # Send to Discord
+        fields = [
+            {"name": "🔌 Port", "value": str(port), "inline": True},
+            {"name": "📡 Protocol", "value": protocol.upper(), "inline": True},
+            {"name": "⚡ Rate Limit", "value": f"{rate_limit}/s", "inline": True},
+            {"name": "💥 Burst", "value": str(burst), "inline": True},
+            {"name": "✅ Established Connections", "value": "Always allowed", "inline": False}
+        ]
+        self.discord.send_message(
+            title="✅ Port Protection Enabled",
+            description=f"Port {port} is now protected. Established connections are preserved.",
+            color=0x2ecc71,
+            fields=fields
+        )
+    
+    def setup_minecraft_protection(self, port=25565):
+        """Setup optimized protection for Minecraft servers"""
+        
+        # Skip if whitelisted
+        if port in self.whitelisted_ports:
+            self.log(f"Minecraft port {port} is whitelisted, skipping special protection", "INFO")
+            return
+        
+        self.log(f"Setting up Minecraft server protection on port {port}...")
+        
+        # Use configured values
+        tcp_rate = self.config.get('MINECRAFT_TCP_RATE', 50)
+        tcp_burst = self.config.get('MINECRAFT_TCP_BURST', 100)
+        udp_rate = self.config.get('MINECRAFT_UDP_RATE', 100)
+        udp_burst = self.config.get('MINECRAFT_UDP_BURST', 150)
+        max_conn = self.config.get('MINECRAFT_MAX_CONN_PER_IP', 3)
+        
+        self.protect_port(port, protocol='tcp', rate_limit=tcp_rate, burst=tcp_burst)
+        self.protect_port(port, protocol='udp', rate_limit=udp_rate, burst=udp_burst)
+        
+        rules = [
+            # Limit connections per IP (but allow established)
+            f"iptables -A INPUT -p tcp --dport {port} --syn -m connlimit --connlimit-above {max_conn} -j REJECT --reject-with tcp-reset",
+            # Drop oversized UDP packets
+            f"iptables -A INPUT -p udp --dport {port} -m length --length 1500:65535 -j DROP"
+        ]
+        
+        for rule in rules:
+            self.run_command(rule)
+        
+        self.log(f"Minecraft server on port {port} is now protected", "SUCCESS")
+        
+        # Send Minecraft-specific alert
+        fields = [
+            {"name": "🎮 Server Type", "value": "Minecraft", "inline": True},
+            {"name": "🔌 Port", "value": str(port), "inline": True},
+            {"name": "🛡️ Protection", "value": "TCP + UDP", "inline": True},
+            {"name": "👥 Max Connections/IP", "value": str(max_conn), "inline": True},
+            {"name": "⚡ TCP Rate", "value": f"{tcp_rate}/s", "inline": True},
+            {"name": "⚡ UDP Rate", "value": f"{udp_rate}/s", "inline": True}
+        ]
+        self.discord.send_message(
+            title="🎮 Minecraft Protection Active",
+            description="Minecraft server protected with optimized rules. Players can stay connected!",
+            color=0x2ecc71,
+            fields=fields
+        )
+    
+    def analyze_attacks(self):
+        """Analyze dropped packets and detect attacks"""
+        success, output, _ = self.run_command("iptables -L -n -v -x")
+        
+        if not success:
+            return []
+        
+        attacks_detected = []
+        lines = output.split('\n')
+        threshold = self.config.get('ATTACK_THRESHOLD', 1000)
+        
+        for line in lines:
+            if 'DROP' in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        packets = int(parts[0])
+                        if packets > threshold:
+                            attacks_detected.append({
+                                'packets': packets,
+                                'rule': line.strip()
+                            })
+                    except ValueError:
+                        continue
+        
+        return attacks_detected
+    
+    def show_statistics(self):
+        """Display current iptables statistics"""
+        self.log("Gathering protection statistics...")
+        success, output, _ = self.run_command("iptables -L -n -v -x")
+        
+        if success:
+            print("\n" + output)
+            
+            # Calculate total dropped packets
+            total_dropped = 0
+            lines = output.split('\n')
+            for line in lines:
+                if 'DROP' in line:
+                    parts = line.split()
+                    if len(parts) >= 1:
+                        try:
+                            total_dropped += int(parts[0])
+                        except ValueError:
+                            continue
+            
+            # Calculate uptime
+            uptime = datetime.now() - self.start_time
+            uptime_str = str(uptime).split('.')[0]
+            
+            # Send to Discord
+            self.discord.send_statistics(self.protected_ports, self.whitelisted_ports, total_dropped, uptime_str)
+            
+            return total_dropped
+        return 0
+    
+    def save_rules(self):
+        """Save iptables rules to persist across reboots"""
+        self.log("Saving iptables rules...")
+        
+        commands = [
+            "mkdir -p /etc/iptables 2>/dev/null",
+            "iptables-save > /etc/iptables/rules.v4",
+            "service iptables save",
+            "netfilter-persistent save"
+        ]
+        
+        for cmd in commands:
+            success, _, _ = self.run_command(cmd)
+            if success:
+                self.log("Rules saved successfully", "SUCCESS")
+                return
+        
+        self.log("Could not save rules automatically. Use 'iptables-save' manually.", "WARNING")
+    
+    def monitor_mode(self, interval=None):
+        """Monitor mode - continuously check for attacks"""
+        if interval is None:
+            interval = self.config.get('MONITOR_INTERVAL', 60)
+        
+        self.log(f"Starting monitor mode (checking every {interval} seconds)...")
+        self.log("Press Ctrl+C to stop")
+        
+        # Send monitoring start notification
+        fields = [
+            {"name": "⏱️ Check Interval", "value": f"{interval} seconds", "inline": True},
+            {"name": "🔒 Protected Ports", "value": str(len(self.protected_ports)), "inline": True},
+            {"name": "✅ Whitelisted Ports", "value": str(len(self.whitelisted_ports)), "inline": True},
+            {"name": "📋 Protected", "value": ", ".join(map(str, self.protected_ports)) if self.protected_ports else "None", "inline": False},
+            {"name": "✅ Whitelisted", "value": ", ".join(map(str, self.whitelisted_ports)), "inline": False}
+        ]
+        self.discord.send_message(
+            title="👁️ Monitor Mode Started",
+            description="WeDDOS Guard is now actively monitoring for attacks",
+            color=0x3498db,
+            fields=fields
+        )
+        
+        try:
+            check_count = 0
+            stats_interval = self.config.get('STATS_REPORT_INTERVAL', 10)
+            
+            while True:
+                check_count += 1
+                
+                # Analyze for attacks
+                attacks = self.analyze_attacks()
+                
+                if attacks:
+                    for attack in attacks:
+                        self.log(f"Attack detected: {attack['packets']} packets dropped", "WARNING")
+                        
+                        # Send attack alert
+                        fields = [
+                            {"name": "🚫 Packets Dropped", "value": str(attack['packets']), "inline": True},
+                            {"name": "📋 Rule", "value": f"```{attack['rule'][:100]}```", "inline": False}
+                        ]
+                        self.discord.send_message(
+                            title="⚠️ High Traffic Detected",
+                            description="Potential attack blocked by WeDDOS Guard",
+                            color=0xf39c12,
+                            fields=fields
+                        )
+                
+                # Send periodic statistics
+                if check_count % stats_interval == 0:
+                    total_dropped = self.show_statistics()
+                    uptime = datetime.now() - self.start_time
+                    uptime_str = str(uptime).split('.')[0]
+                    
+                    self.log(f"Monitor check #{check_count} - Total dropped: {total_dropped}")
+                
+                time.sleep(interval)
+                
+        except KeyboardInterrupt:
+            self.log("Monitor mode stopped", "INFO")
+            
+            # Send stop notification
+            uptime = datetime.now() - self.start_time
+            uptime_str = str(uptime).split('.')[0]
+            
+            fields = [
+                {"name": "⏱️ Total Uptime", "value": uptime_str, "inline": True},
+                {"name": "🔍 Total Checks", "value": str(check_count), "inline": True}
+            ]
+            self.discord.send_message(
+                title="🛑 Monitor Mode Stopped",
+                description="WeDDOS Guard monitoring has been stopped",
+                color=0x95a5a6,
+                fields=fields
+            )
 
 def main():
-    if os.geteuid() != 0:
-        print("Run as root")
+    parser = argparse.ArgumentParser(
+        description='WeDDOS Guard - Advanced DDoS Protection System with Discord Integration',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sudo python3 weddos_guard.py --auto
+  sudo python3 weddos_guard.py --auto --minecraft --monitor
+  sudo python3 weddos_guard.py -p 8080,9000 --whitelist 22,80,443
+  sudo python3 weddos_guard.py --auto -w "DISCORD_WEBHOOK_URL"
+        """
+    )
+    
+    parser.add_argument('-a', '--auto', action='store_true',
+                       help='Auto-detect and protect all open ports')
+    parser.add_argument('-p', '--ports', type=str,
+                       help='Comma-separated list of ports to protect (e.g., 80,443,25565)')
+    parser.add_argument('-m', '--minecraft', type=int, nargs='?', const=25565,
+                       help='Enable Minecraft server protection (default port: 25565)')
+    parser.add_argument('-r', '--rate-limit', type=int,
+                       help=f'Rate limit (connections per second, default: {CONFIG["DEFAULT_RATE_LIMIT"]})')
+    parser.add_argument('-b', '--burst', type=int,
+                       help=f'Burst limit (default: {CONFIG["DEFAULT_BURST_LIMIT"]})')
+    parser.add_argument('-w', '--webhook', type=str,
+                       help='Discord webhook URL for logging and alerts')
+    parser.add_argument('--whitelist', type=str,
+                       help='Comma-separated list of ports to whitelist (e.g., 22,80,443)')
+    parser.add_argument('--monitor', action='store_true',
+                       help='Enable monitoring mode')
+    parser.add_argument('--monitor-interval', type=int,
+                       help=f'Monitor check interval in seconds (default: {CONFIG["MONITOR_INTERVAL"]})')
+    parser.add_argument('--stats', action='store_true',
+                       help='Show current statistics')
+    parser.add_argument('--save', action='store_true',
+                       help='Save rules to persist across reboots')
+    parser.add_argument('--show-config', action='store_true',
+                       help='Show current configuration and exit')
+    
+    args = parser.parse_args()
+    
+    # Show configuration if requested
+    if args.show_config:
+        print("=" * 60)
+        print("WeDDOS Guard - Current Configuration")
+        print("=" * 60)
+        for key, value in CONFIG.items():
+            print(f"{key}: {value}")
+        print("=" * 60)
+        sys.exit(0)
+    
+    # Override config with command-line arguments
+    config = CONFIG.copy()
+    if args.rate_limit:
+        config['DEFAULT_RATE_LIMIT'] = args.rate_limit
+    if args.burst:
+        config['DEFAULT_BURST_LIMIT'] = args.burst
+    if args.monitor_interval:
+        config['MONITOR_INTERVAL'] = args.monitor_interval
+    if args.whitelist:
+        # Add to existing whitelist
+        new_ports = [int(p.strip()) for p in args.whitelist.split(',')]
+        config['WHITELISTED_PORTS'].extend(new_ports)
+        config['WHITELISTED_PORTS'] = list(set(config['WHITELISTED_PORTS']))  # Remove duplicates
+    
+    guard = WeDDOSGuard(config=config, webhook_url=args.webhook)
+    
+    print("=" * 60)
+    print("WeDDOS Guard - DDoS Protection System")
+    print("=" * 60)
+    print(f"Version: 2.0 | Configurable & Whitelist Support")
+    print("=" * 60)
+    
+    # Check root privileges
+    if not guard.check_root():
+        guard.log("This script requires root privileges!", "ERROR")
+        guard.log("Please run with: sudo python3 weddos_guard.py", "ERROR")
         sys.exit(1)
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-
-    apply_sysctl_hardening()
-    ensure_ipset()
-    fetch_and_block_ip_lists()
-    ensure_chains()
-    apply_raw_filters()
-    apply_global_filters()
-    send_discord("✅ WeDDOS Guard v3.3 started")
-
-    while True:
-        try:
-            # 1) SSH brute force
-            check_log_for_bruteforce()
-
-            # 2) gather listening ports (once) and apply per-port protections
-            ports = set()
-            ss_out = run("ss -lntuH || true")
-            for line in ss_out.splitlines():
-                m = re.search(r':(\d+)\b', line)
-                if m:
-                    port = int(m.group(1))
-                    if port not in WHITELIST_PORTS:
-                        ports.add(port)
-            for p in ports:
-                apply_port_protections(p)
-
-            # 3) dynamic monitoring
-            attackers, total_new_conn = get_attackers()
-            if total_new_conn >= GLOBAL_NEW_CONN_WARNING:
-                escalate_global(total_new_conn)
+    
+    # Send startup notification
+    if guard.discord.enabled:
+        fields = [
+            {"name": "⚙️ Rate Limit", "value": f"{config['DEFAULT_RATE_LIMIT']}/s", "inline": True},
+            {"name": "💥 Burst Limit", "value": str(config['DEFAULT_BURST_LIMIT']), "inline": True},
+            {"name": "✅ Whitelisted Ports", "value": ", ".join(map(str, guard.whitelisted_ports)), "inline": False}
+        ]
+        guard.discord.send_message(
+            title="🚀 WeDDOS Guard Starting",
+            description="DDoS protection system is initializing...\nEstablished connections will be preserved.",
+            color=0x3498db,
+            fields=fields
+        )
+    
+    # Check existing rules
+    guard.check_existing_rules()
+    
+    # Setup whitelist FIRST (before any blocking rules)
+    guard.setup_whitelist_rules()
+    
+    # Setup base protection
+    guard.setup_base_protection()
+    
+    # Auto-detect and protect ports
+    if args.auto:
+        ports = guard.detect_open_ports()
+        for port in ports:
+            if port not in guard.whitelisted_ports:
+                guard.protect_port(port, rate_limit=config['DEFAULT_RATE_LIMIT'], burst=config['DEFAULT_BURST_LIMIT'])
             else:
-                relax_global()
-
-            # handle attackers: add only top N this loop to reduce churn
-            if attackers:
-                # sort descending by count
-                attackers_sorted = sorted(attackers, key=lambda x: -x[1])
-                to_add = 0
-                for ip, cnt in attackers_sorted:
-                    offender_counts[ip] = offender_counts.get(ip, 0) + 1
-                    if offender_counts[ip] >= REPEAT_HITCOUNT and ip not in blocked_ips:
-                        block_ip_safe(ip, reason=f"high conn {cnt}")
-                        offender_counts[ip] = 0
-                        to_add += 1
-                        if to_add >= BATCH_ADD_LIMIT:
-                            break
-
-            # decay offender counts
-            for ip in list(offender_counts.keys()):
-                offender_counts[ip] = max(0, offender_counts[ip] - 1)
-                if offender_counts[ip] == 0:
-                    del offender_counts[ip]
-
-            time.sleep(CHECK_INTERVAL)
-
-        except Exception as e:
-            log(f"Main loop exception: {e}")
-            time.sleep(1)
+                guard.log(f"Skipping port {port} (whitelisted)", "INFO")
+        
+        # Auto-protect Minecraft if enabled in config
+        if config.get('PROTECT_MINECRAFT_AUTO'):
+            for port in guard.minecraft_ports:
+                if port in ports and port not in guard.whitelisted_ports:
+                    guard.setup_minecraft_protection(port)
+    
+    # Protect specific ports
+    if args.ports:
+        ports = [int(p.strip()) for p in args.ports.split(',')]
+        for port in ports:
+            guard.protect_port(port, rate_limit=config['DEFAULT_RATE_LIMIT'], burst=config['DEFAULT_BURST_LIMIT'])
+    
+    # Minecraft protection
+    if args.minecraft:
+        guard.setup_minecraft_protection(args.minecraft)
+    
+    # Show statistics
+    if args.stats:
+        guard.show_statistics()
+    
+    # Save rules
+    if args.save or config.get('AUTO_SAVE_RULES'):
+        guard.save_rules()
+    
+    # Monitor mode
+    if args.monitor:
+        guard.monitor_mode(interval=config['MONITOR_INTERVAL'])
+    
+    guard.log("WeDDOS Guard setup complete!", "SUCCESS")
+    guard.log(f"Protected ports: {guard.protected_ports}")
+    guard.log(f"Whitelisted ports: {guard.whitelisted_ports}")
+    
+    # Send completion notification
+    if guard.discord.enabled:
+        uptime = datetime.now() - guard.start_time
+        uptime_str = str(uptime).split('.')[0]
+        
+        fields = [
+            {"name": "🔒 Protected Ports", "value": str(len(guard.protected_ports)), "inline": True},
+            {"name": "✅ Whitelisted Ports", "value": str(len(guard.whitelisted_ports)), "inline": True},
+            {"name": "⏱️ Setup Time", "value": uptime_str, "inline": True},
+            {"name": "📋 Protected", "value": ", ".join(map(str, guard.protected_ports)) if guard.protected_ports else "None", "inline": False},
+            {"name": "✅ Whitelisted", "value": ", ".join(map(str, guard.whitelisted_ports)), "inline": False},
+            {"name": "🔄 Established Connections", "value": "Always preserved", "inline": False}
+        ]
+        guard.discord.send_message(
+            title="✅ WeDDOS Guard Active",
+            description="DDoS protection is now fully operational!\nYour existing connections remain safe.",
+            color=0x2ecc71,
+            fields=fields
+        )
+    
+    print("=" * 60)
+    print("Configuration Summary:")
+    print(f"  • Protected Ports: {len(guard.protected_ports)}")
+    print(f"  • Whitelisted Ports: {len(guard.whitelisted_ports)}")
+    print(f"  • Rate Limit: {config['DEFAULT_RATE_LIMIT']}/s")
+    print(f"  • Burst Limit: {config['DEFAULT_BURST_LIMIT']}")
+    print(f"  • Discord Alerts: {'Enabled' if guard.discord.enabled else 'Disabled'}")
+    print(f"  • Established Connections: Protected")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
